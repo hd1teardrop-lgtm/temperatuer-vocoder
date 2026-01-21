@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>temperatuer vocoder</title>
+<style>
+body {
+    background:#0a0a0a;
+    color:#eee;
+    font-family: monospace;
+    text-align:center;
+    padding:30px;
+}
+button, input, select {
+    margin:6px;
+    padding:6px;
+}
+</style>
+</head>
+<body>
+
+<h1>temperatuer</h1>
+
+<button id="start">Start Vocoder</button><br><br>
+
+<label>Modulator Source</label><br>
+<select id="modType">
+    <option value="mic">Microphone</option>
+    <option value="file">Audio File</option>
+</select><br>
+
+<input type="file" id="modFile" accept="audio/*"><br><br>
+
+<label>Carrier Type</label><br>
+<select id="carrierType">
+    <option value="osc">Oscillator</option>
+    <option value="noise">Noise</option>
+    <option value="file">Audio File</option>
+</select><br>
+
+<input type="file" id="carFile" accept="audio/*"><br><br>
+
+<label>Carrier Frequency / MIDI</label><br>
+<input type="range" id="freq" min="50" max="1000" value="120"><br>
+
+<label>Formant Shift</label><br>
+<input type="range" id="formant" min="0.5" max="2" step="0.01" value="1">
+
+<script>
+const ctx = new (window.AudioContext || window.webkitAudioContext)();
+
+let modSource, modFileSource;
+let carrierOsc, noiseSource, carFileSource;
+let carrierGain;
+let bands = [];
+
+const baseBands = [150, 300, 600, 1200, 2400, 4800];
+
+// ---------- NOISE ----------
+function createNoise() {
+    const buffer = ctx.createBuffer(1, ctx.sampleRate * 2, ctx.sampleRate);
+    const data = buffer.getChannelData(0);
+    for (let i = 0; i < data.length; i++) {
+        data[i] = Math.random() * 2 - 1;
+    }
+    const src = ctx.createBufferSource();
+    src.buffer = buffer;
+    src.loop = true;
+    return src;
+}
+
+// ---------- MIDI ----------
+navigator.requestMIDIAccess?.().then(midi => {
+    for (let input of midi.inputs.values()) {
+        input.onmidimessage = e => {
+            const [cmd, note, vel] = e.data;
+            if (cmd === 144 && vel > 0 && carrierOsc) {
+                carrierOsc.frequency.value =
+                    440 * Math.pow(2, (note - 69) / 12);
+            }
+        };
+    }
+});
+
+// ---------- FILE LOADERS ----------
+async function loadFile(file, loop = true) {
+    const buf = await ctx.decodeAudioData(await file.arrayBuffer());
+    const src = ctx.createBufferSource();
+    src.buffer = buf;
+    src.loop = loop;
+    return src;
+}
+
+document.getElementById("modFile").onchange = async e => {
+    if (modFileSource) modFileSource.stop();
+    modFileSource = await loadFile(e.target.files[0]);
+};
+
+document.getElementById("carFile").onchange = async e => {
+    if (carFileSource) carFileSource.stop();
+    carFileSource = await loadFile(e.target.files[0]);
+    carFileSource.connect(carrierGain);
+    carFileSource.start();
+};
+
+// ---------- VOCODER ----------
+async function startVocoder() {
+    const output = ctx.createGain();
+    output.gain.value = 0.8;
+    output.connect(ctx.destination);
+
+    // MODULATOR
+    const modType = document.getElementById("modType").value;
+
+    if (modType === "mic") {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        modSource = ctx.createMediaStreamSource(stream);
+    } else {
+        modSource = modFileSource;
+        modSource.start();
+    }
+
+    // CARRIER
+    carrierGain = ctx.createGain();
+
+    carrierOsc = ctx.createOscillator();
+    carrierOsc.type = "sawtooth";
+    carrierOsc.frequency.value = 120;
+
+    noiseSource = createNoise();
+
+    carrierOsc.connect(carrierGain);
+    noiseSource.connect(carrierGain);
+
+    baseBands.forEach(freq => {
+        const modFilter = ctx.createBiquadFilter();
+        modFilter.type = "bandpass";
+        modFilter.frequency.value = freq;
+        modFilter.Q.value = 10;
+
+        const carFilter = ctx.createBiquadFilter();
+        carFilter.type = "bandpass";
+        carFilter.frequency.value = freq;
+        carFilter.Q.value = 10;
+
+        const envelope = ctx.createGain();
+        envelope.gain.value = 0;
+
+        const rectifier = ctx.createWaveShaper();
+        rectifier.curve = new Float32Array([0, 1]);
+
+        const follower = ctx.createBiquadFilter();
+        follower.type = "lowpass";
+        follower.frequency.value = 12;
+
+        modSource.connect(modFilter);
+        modFilter.connect(rectifier);
+        rectifier.connect(follower);
+        follower.connect(envelope.gain);
+
+        carrierGain.connect(carFilter);
+        carFilter.connect(envelope);
+        envelope.connect(output);
+
+        bands.push({ modFilter, carFilter });
+    });
+
+    carrierOsc.start();
+    noiseSource.start();
+}
+
+// ---------- UI ----------
+document.getElementById("start").onclick = () => {
+    if (ctx.state !== "running") ctx.resume();
+    startVocoder();
+};
+
+document.getElementById("freq").oninput = e => {
+    if (carrierOsc) carrierOsc.frequency.value = e.target.value;
+};
+
+document.getElementById("carrierType").onchange = e => {
+    if (!carrierGain) return;
+    carrierGain.disconnect();
+
+    if (e.target.value === "osc") carrierOsc.connect(carrierGain);
+    if (e.target.value === "noise") noiseSource.connect(carrierGain);
+    if (e.target.value === "file" && carFileSource)
+        carFileSource.connect(carrierGain);
+};
+
+document.getElementById("formant").oninput = e => {
+    const shift = parseFloat(e.target.value);
+    bands.forEach((b, i) => {
+        const f = baseBands[i] * shift;
+        b.modFilter.frequency.value = f;
+        b.carFilter.frequency.value = f;
+    });
+};
+</script>
+
+</body>
+</html>
